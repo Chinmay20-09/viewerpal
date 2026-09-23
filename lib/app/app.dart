@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../core/models/document_file.dart';
 import '../features/home/home_screen.dart';
+import '../features/pdf_editor/pdf_editor_screen.dart';
 import '../features/viewer/viewer_screen.dart';
 
 /// Root MaterialApp for the Document Environment.
@@ -26,6 +27,14 @@ class DocumentEnvironmentApp extends StatelessWidget {
           if (args is DocumentFile) {
             return MaterialPageRoute<void>(
               builder: (_) => ViewerScreen(document: args),
+            );
+          }
+        }
+        if (settings.name == PdfEditorScreen.routeName) {
+          final args = settings.arguments;
+          if (args is DocumentFile) {
+            return MaterialPageRoute<void>(
+              builder: (_) => PdfEditorScreen(document: args),
             );
           }
         }
