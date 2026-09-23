@@ -1,0 +1,138 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_pdfview/flutter_pdfview.dart';
+
+import '../../core/models/document_file.dart';
+import '../document_engine.dart';
+
+/// PDF engine using the native Android PDFView.
+///
+/// Viewing is fully supported; editing is out of MVP scope (P3).
+class PdfDocumentEngine extends DocumentEngine {
+  @override
+  String get name => 'PdfDocumentEngine';
+
+  @override
+  EngineCapabilities get capabilities => const EngineCapabilities(
+        canEdit: false,
+        canSave: false,
+        canSaveAs: false,
+      );
+
+  @override
+  Future<void> open(DocumentFile document) async {
+    final f = File(document.uri);
+    if (!f.existsSync()) {
+      throw DocumentOpenException('File not found: ${document.filename}');
+    }
+    if (f.lengthSync() == 0) {
+      throw DocumentOpenException('File is empty: ${document.filename}');
+    }
+    // Light header validation; real rendering happens in the native view.
+    final raf = f.openSync();
+    try {
+      final header = raf.readSync(5);
+      final isPdf = header.length == 5 &&
+          header[0] == 0x25 && // %
+          header[1] == 0x50 && // P
+          header[2] == 0x44 && // D
+          header[3] == 0x46 && // F
+          header[4] == 0x2D; // -
+      if (!isPdf) {
+        throw DocumentOpenException(
+          'This file does not look like a valid PDF document.',
+        );
+      }
+    } finally {
+      raf.closeSync();
+    }
+  }
+
+  @override
+  Widget buildViewer(BuildContext context, DocumentFile document) {
+    return _PdfViewer(document: document);
+  }
+
+  @override
+  Future<SaveResult> save(DocumentFile document) async {
+    throw UnsupportedError('PDF editing/saving is not supported in the MVP.');
+  }
+
+  @override
+  Future<SaveResult> saveAs(DocumentFile document) async {
+    throw UnsupportedError('PDF editing/saving is not supported in the MVP.');
+  }
+
+  @override
+  void dispose() {}
+}
+
+class _PdfViewer extends StatefulWidget {
+  const _PdfViewer({required this.document});
+
+  final DocumentFile document;
+
+  @override
+  State<_PdfViewer> createState() => _PdfViewerState();
+}
+
+class _PdfViewerState extends State<_PdfViewer> {
+  int? _pages;
+  int _currentPage = 0;
+  String? _error;
+
+  @override
+  Widget build(BuildContext context) {
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            'Could not render PDF.\n$_error',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+    return Stack(
+      children: [
+        PDFView(
+          filePath: widget.document.uri,
+          enableSwipe: true,
+          swipeHorizontal: false,
+          autoSpacing: true,
+          pageFling: true,
+          onError: (error) => setState(() => _error = error.toString()),
+          onPageError: (page, error) =>
+              setState(() => _error = 'page $page: $error'),
+          onRender: (pages) => setState(() => _pages = pages),
+          onPageChanged: (page, total) {
+            if (page != null) setState(() => _currentPage = page);
+          },
+        ),
+        if (_pages == null) const Center(child: CircularProgressIndicator()),
+        if (_pages != null)
+          Positioned(
+            bottom: 12,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: Material(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(16),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  child: Text(
+                    'Page ${_currentPage + 1} / $_pages',
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
