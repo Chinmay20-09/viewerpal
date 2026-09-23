@@ -4,11 +4,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_pdfview/flutter_pdfview.dart';
 
 import '../../core/models/document_file.dart';
+import '../../features/pdf_editor/pdf_editor_screen.dart';
 import '../document_engine.dart';
 
 /// PDF engine using the native Android PDFView.
 ///
-/// Viewing is fully supported; editing is out of MVP scope (P3).
+/// Viewing is fully supported. Editing is provided by a dedicated editor
+/// ([PdfEditorScreen]) that manages ONLY user-added text/images and writes
+/// the result to a NEW file via Save As; the original file stays untouched
 class PdfDocumentEngine extends DocumentEngine {
   @override
   String get name => 'PdfDocumentEngine';
@@ -52,6 +55,15 @@ class PdfDocumentEngine extends DocumentEngine {
   @override
   Widget buildViewer(BuildContext context, DocumentFile document) {
     return _PdfViewer(document: document);
+  }
+
+  /// Opens the dedicated PDF editor for this document.
+  ///
+  /// Kept as a small, additive entry point so the existing viewer and the
+  /// DocumentEngine/ViewerScreen contracts remain unchanged.
+  void openEditor(BuildContext context, DocumentFile document) {
+    Navigator.of(context).pushNamed(PdfEditorScreen.routeName,
+        arguments: document);
   }
 
   @override
@@ -132,6 +144,21 @@ class _PdfViewerState extends State<_PdfViewer> {
               ),
             ),
           ),
+        // Additive entry point to the dedicated PDF editor; the existing
+        // viewer behavior (PDFView, page indicator) is untouched.
+        Positioned(
+          right: 16,
+          bottom: 56,
+          child: FloatingActionButton.extended(
+            heroTag: 'pdf_edit_fab',
+            tooltip: 'Edit PDF',
+            icon: const Icon(Icons.edit),
+            label: const Text('Edit'),
+            onPressed: () {
+              PdfDocumentEngine().openEditor(context, widget.document);
+            },
+          ),
+        ),
       ],
     );
   }
