@@ -60,6 +60,14 @@ class PptxDocumentEngine extends DocumentEngine {
     if (bytes.isEmpty) {
       throw DocumentOpenException('File is empty: ${document.filename}');
     }
+    // PPTX is a ZIP; check the magic bytes (PK) for a friendly error.
+    // (The zip decoder can be lenient with garbage input, so this check
+    // happens before parsing — same approach as the DOCX engine.)
+    if (bytes.length < 2 || bytes[0] != 0x50 || bytes[1] != 0x4B) {
+      throw DocumentOpenException(
+        'This file does not look like a valid PPTX document.',
+      );
+    }
     try {
       _doc = PptxParser.parse(bytes);
       _originalBytes = bytes;
