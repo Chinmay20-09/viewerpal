@@ -1,25 +1,34 @@
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:docx_creator/docx_creator.dart';
 import 'package:docx_file_viewer/docx_file_viewer.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/models/document_file.dart';
+import '../../core/services/document_access.dart';
 import '../document_engine.dart';
-
-/// DOCX engine: parse existing .docx into a docx_creator AST, allow basic
-/// text-level edits in that AST, export via DocxExporter, and Save As through
-/// the Android SAF dialog. Viewing (untouched document) still uses
-/// docx_file_viewer for native rendering, search and zoom.
+/// DOCX engine: inline editing on the SAME viewer screen.
 ///
-/// The original file is never overwritten: only Save As is offered.
-class DocxDocumentEngine extends DocumentEngine {
+/// One document model is loaded (parse once), viewed and edited in place:
+///
+///   DocxDocumentEngine
+///     ├── loaded document model (DocxBuiltDocument)
+///     ├── buildViewer()   → view mode AND edit mode widgets (same screen)
+///     └── saveAs()        → DocxExporter → bytes → SAF Save As
+///
+/// The parse happens ONCE in [open]; editing only mutates the in-memory
+/// model. The original document is never overwritten: Save As always
+/// produces `<original-name> (edited).docx`.
+class DocxDocumentEngine extends InlineEditingEngine {
   DocxBuiltDocument? _document;
   bool _dirty = false;
   Uint8List? _cachedPreview;
   bool _previewStale = true;
+  String? _lastSavedName;
+  String? _lastSavedUri;
+
+  final ValueNotifier<bool> _editMode = ValueNotifier<bool>(false);
+  SaveAsBytes _saveAsHandler = _defaultSaveAsHandler;
 
   @override
   String get name => 'DocxDocumentEngine';
@@ -31,28 +40,44 @@ class DocxDocumentEngine extends DocumentEngine {
         canSaveAs: true,
       );
 
+  @override
+  ValueNotifier<bool> get editMode => _editMode;
+
+  @override
+  bool get isDirty => _dirty;
+
+  @override
+  String get lastSavedName => _lastSavedName ?? '';
+
+  @override
+  String? get lastSavedUri => _lastSavedUri;
+
+  @override
+  void setSaveAsHandler(SaveAsBytes handler) {
+    _saveAsHandler = handler;
+  }
+
+  static Future<Uri?> _defaultSaveAsHandler(
+    Uint8List bytes,
+    String suggestedFileName,
+    String mimeType,
+  ) {
+    throw UnimplementedError('No Save As handler installed');
+  }
+
+  /// Reads document bytes through [DocumentAccess], which understands both
+  /// plain filesystem paths and Android SAF `content://` URIs (resolved via
+  /// the content resolver — never treated as a temp path).
   Future<void> _ensureLoaded(DocumentFile document) async {
     if (_document != null) return;
-    final f = File(document.uri);
-    if (!f.existsSync()) {
-      throw DocumentOpenException('File not found: ${document.filename}');
-    }
-    if (f.lengthSync() == 0) {
-      throw DocumentOpenException('File is empty: ${document.filename}');
-    }
-    // DOCX is a ZIP; check the magic bytes (PK) for a friendly error.
-    final raf = f.openSync();
+    final Uint8List bytes;
     try {
-      final header = raf.readSync(2);
-      if (header.length < 2 || header[0] != 0x50 || header[1] != 0x4B) {
-        throw DocumentOpenException(
-          'This file does not look like a valid DOCX document.',
-        );
-      }
-    } finally {
-      raf.closeSync();
+      bytes = await DocumentAccess.readBytes(document.uri);
+    } on DocumentAccessException catch (e) {
+      // Normalize resolver failures (missing/empty/revoked URI) into the
+      // engine-level open error so the viewer shows a friendly message.
+      throw DocumentOpenException(e.message, e);
     }
-    final bytes = await f.readAsBytes();
     try {
       _document = await DocxReader.loadFromBytes(bytes);
     } catch (e) {
@@ -68,7 +93,7 @@ class DocxDocumentEngine extends DocumentEngine {
 
   @override
   Widget buildViewer(BuildContext context, DocumentFile document) {
-    return _DocxViewer(engine: this, document: document);
+    return _DocxInlineEditor(engine: this, document: document);
   }
 
   // --------------------------------------------------------------------
@@ -77,9 +102,6 @@ class DocxDocumentEngine extends DocumentEngine {
 
   /// True when a document has been parsed and is ready for edits/export.
   bool get isLoaded => _document != null;
-
-  /// True when at least one edit has been applied since the last load.
-  bool get isDirty => _dirty;
 
   /// Flat text representation of paragraphs, in document order.
   ///
@@ -107,32 +129,6 @@ class DocxDocumentEngine extends DocumentEngine {
       }
     }
     return result;
-  }
-
-  /// Replaces the text of a single text run inside a paragraph.
-  ///
-  /// [paragraphIndex] refers to top-level [DocxParagraph] blocks in document
-  /// order (same ordering as [paragraphs]).
-  bool editTextRun(int paragraphIndex, int runIndex, String newText) {
-    final doc = _document;
-    if (doc == null) return false;
-    final paragraphs =
-        doc.elements.whereType<DocxParagraph>().toList(growable: false);
-    if (paragraphIndex < 0 || paragraphIndex >= paragraphs.length) {
-      return false;
-    }
-    final p = paragraphs[paragraphIndex];
-    if (runIndex < 0 || runIndex >= p.children.length) return false;
-    final child = p.children[runIndex];
-    if (child is! DocxText) return false;
-
-    final newChildren = List<DocxInline>.from(p.children);
-    newChildren[runIndex] = child.copyWith(content: newText);
-    final updated = p.copyWith(children: newChildren);
-    _replaceParagraph(doc, p, updated);
-    _dirty = true;
-    _previewStale = true;
-    return true;
   }
 
   /// Replaces the full text content of a paragraph with [newText].
@@ -259,18 +255,32 @@ class DocxDocumentEngine extends DocumentEngine {
     );
   }
 
+  /// Serializes the current model and hands the bytes to the injected
+  /// Save As handler (Android SAF dialog). Cancelling keeps everything
+  /// unchanged; success records the new copy so it can be shared/reopened.
   @override
   Future<SaveResult> saveAs(DocumentFile document) async {
     final bytes = await exportBytes();
     final base =
         document.filename.replaceAll(RegExp(r'\.docx$', caseSensitive: false), '');
-    final uri = await FilePicker.saveFile(
-      fileName: '$base (edited).docx',
-      bytes: bytes,
-      mimeType:
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    );
+    final suggestedName = '$base (edited).docx';
+    final uri = await _saveAsHandler(bytes, suggestedName,
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
     if (uri == null) return SaveResult.cancelled;
+
+    final savedUri = uri.toString();
+    if (DocumentAccess.isContentUri(savedUri)) {
+      // The SAF destination is not a plain filesystem path: keep an
+      // app-managed copy as the openable artifact for Share/reopen, while
+      // remembering the content URI as the canonical destination.
+      _lastSavedUri = await DocumentAccess.storeLocalCopy(
+          suggestedName, bytes);
+    } else {
+      _lastSavedUri = savedUri;
+    }
+    _lastSavedName = suggestedName;
+    _dirty = false;
+    _previewStale = true;
     return SaveResult.savedAs;
   }
 
@@ -278,6 +288,7 @@ class DocxDocumentEngine extends DocumentEngine {
   void dispose() {
     _document = null;
     _cachedPreview = null;
+    _editMode.dispose();
   }
 }
 
@@ -300,78 +311,153 @@ class EditableParagraph {
 }
 
 // ==========================================================================
-// Viewer / editor UI
+// Inline viewer/editor — ONE widget, ONE screen, TWO modes.
+//
+// There is intentionally NO toggle button, NO Apply button and NO separate
+// editor route: the ViewerScreen app bar drives [DocxDocumentEngine.editMode]
+// and this widget reacts. View mode shows the document; edit mode shows the
+// SAME content as borderless editable fields that resemble document text.
 // ==========================================================================
 
-class _DocxViewer extends StatefulWidget {
-  const _DocxViewer({required this.engine, required this.document});
+class _DocxInlineEditor extends StatefulWidget {
+  const _DocxInlineEditor({required this.engine, required this.document});
 
   final DocxDocumentEngine engine;
   final DocumentFile document;
 
   @override
-  State<_DocxViewer> createState() => _DocxViewerState();
+  State<_DocxInlineEditor> createState() => _DocxInlineEditorState();
 }
 
-class _DocxViewerState extends State<_DocxViewer> {
-  bool _editMode = false;
+class _DocxInlineEditorState extends State<_DocxInlineEditor> {
   bool _preparingPreview = false;
   bool _hasEdits = false;
+  final _controllers = <int, TextEditingController>{};
+  final _scrollController = ScrollController();
 
-  Future<void> _toggleMode() async {
-    if (_editMode) {
-      // Switching to view mode: re-render from the current AST when edits
-      // exist, so the preview reflects them instead of the original file.
-      setState(() => _preparingPreview = true);
-      try {
-        await widget.engine.previewBytes();
-      } catch (_) {
-        // Preview is best-effort; fall back to the original file view.
-        if (!mounted) return;
-        setState(() => _preparingPreview = false);
-      }
-      if (!mounted) return;
-      setState(() {
-        _preparingPreview = false;
-        _hasEdits = widget.engine.isDirty;
-      });
+  @override
+  void initState() {
+    super.initState();
+    widget.engine.editMode.addListener(_onEditModeChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.engine.editMode.removeListener(_onEditModeChanged);
+    for (final c in _controllers.values) {
+      c.dispose();
     }
-    setState(() => _editMode = !_editMode);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onEditModeChanged() {
+    if (!mounted) return;
+    if (widget.engine.editMode.value) {
+      // Entering edit mode: apply any live controller edits is unnecessary —
+      // controllers ARE the edit state; the model is updated on change.
+    } else {
+      // Leaving edit mode: refresh the rendered preview when edits exist.
+      _refreshPreviewIfDirty();
+    }
+    setState(() {});
+  }
+
+  Future<void> _refreshPreviewIfDirty() async {
+    if (!widget.engine.isDirty && !_hasEdits) return;
+    setState(() => _preparingPreview = true);
+    try {
+      await widget.engine.previewBytes();
+      _hasEdits = true;
+    } catch (_) {
+      // Preview is best-effort; fall back to the original file view.
+      if (!mounted) return;
+    }
+    if (!mounted) return;
+    setState(() => _preparingPreview = false);
+  }
+
+  TextEditingController _controllerFor(int index, String initial) {
+    return _controllers.putIfAbsent(
+      index,
+      () => TextEditingController(text: initial),
+    );
+  }
+
+  void _onTextChanged(int index, String value) {
+    // Bound directly to the loaded model — no Apply step. The parsed AST is
+    // NOT re-parsed; only the affected paragraph is rewritten in memory.
+    widget.engine.editParagraphText(index, value);
   }
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        if (widget.engine.capabilities.canEdit)
-          Align(
-            alignment: Alignment.centerRight,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: TextButton.icon(
-                onPressed: _toggleMode,
-                icon: Icon(_editMode ? Icons.visibility : Icons.edit),
-                label: Text(_editMode ? 'View document' : 'Edit text'),
+    return ValueListenableBuilder<bool>(
+      valueListenable: widget.engine.editMode,
+      builder: (context, editing, _) {
+        if (_preparingPreview) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (editing) {
+          return _buildEditor();
+        }
+        if (_hasEdits) {
+          return _DocxPreview(engine: widget.engine);
+        }
+        return _buildOriginalView();
+      },
+    );
+  }
+
+  Widget _buildOriginalView() {
+    return DocxView.path(
+      widget.document.uri,
+      config: const DocxViewConfig(
+        enableSearch: true,
+        enableZoom: true,
+        pageMode: DocxPageMode.paged,
+      ),
+    );
+  }
+
+  /// Edit mode: the document content itself becomes editable. No labels, no
+  /// borders — fields visually resemble the document text.
+  Widget _buildEditor() {
+    final items = widget.engine.paragraphs();
+    if (items.isEmpty) {
+      return const Center(child: Text('No editable text found.'));
+    }
+    final baseStyle = Theme.of(context).textTheme.bodyLarge;
+    return ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: ListView.builder(
+        controller: _scrollController,
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+        itemCount: items.length,
+        itemBuilder: (context, i) {
+          final item = items[i];
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6),
+            child: TextField(
+              controller: _controllerFor(i, item.text),
+              onChanged: (v) => _onTextChanged(i, v),
+              maxLines: null,
+              keyboardType: TextInputType.multiline,
+              textCapitalization: TextCapitalization.sentences,
+              style: baseStyle?.copyWith(
+                fontSize: item.isHeading ? 20 : null,
+                fontWeight: item.isHeading ? FontWeight.w600 : null,
+                height: 1.35,
+              ),
+              decoration: const InputDecoration(
+                isDense: true,
+                border: InputBorder.none,
+                filled: false,
               ),
             ),
-          ),
-        Expanded(
-          child: _preparingPreview
-              ? const Center(child: CircularProgressIndicator())
-              : _editMode
-                  ? _DocxEditor(engine: widget.engine)
-                  : _hasEdits
-                      ? _DocxPreview(engine: widget.engine)
-                      : DocxView.path(
-                          widget.document.uri,
-                          config: const DocxViewConfig(
-                            enableSearch: true,
-                            enableZoom: true,
-                            pageMode: DocxPageMode.paged,
-                          ),
-                        ),
-        ),
-      ],
+          );
+        },
+      ),
     );
   }
 }
@@ -420,110 +506,6 @@ class _DocxPreviewState extends State<_DocxPreview> {
           ),
         );
       },
-    );
-  }
-}
-
-/// Minimal text editor over the parsed AST. Lists paragraphs so the user can
-/// modify textual content without restructuring the document.
-class _DocxEditor extends StatefulWidget {
-  const _DocxEditor({required this.engine});
-
-  final DocxDocumentEngine engine;
-
-  @override
-  State<_DocxEditor> createState() => _DocxEditorState();
-}
-
-class _DocxEditorState extends State<_DocxEditor> {
-  final _controllers = <int, TextEditingController>{};
-
-  @override
-  void dispose() {
-    for (final c in _controllers.values) {
-      c.dispose();
-    }
-    super.dispose();
-  }
-
-  TextEditingController _controllerFor(int index, String initial) {
-    return _controllers.putIfAbsent(
-      index,
-      () => TextEditingController(text: initial),
-    );
-  }
-
-  void _applyEdits() {
-    final items = widget.engine.paragraphs();
-    var applied = 0;
-    _controllers.forEach((index, controller) {
-      if (index >= 0 && index < items.length) {
-        // The flat text is the concatenation of runs; writing it back
-        // replaces the paragraph's text content with the edited text.
-        if (controller.text != items[index].text &&
-            widget.engine.editParagraphText(index, controller.text)) {
-          applied++;
-        }
-      }
-    });
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(applied > 0
-            ? '$applied edit(s) applied. Use Save As to export.'
-            : 'No changes to apply.'),
-      ),
-    );
-    setState(() {});
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final items = widget.engine.paragraphs();
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  'Text editing — paragraph structure and formatting are kept.',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ),
-              TextButton(
-                onPressed: _applyEdits,
-                child: const Text('Apply'),
-              ),
-            ],
-          ),
-        ),
-        Expanded(
-          child: items.isEmpty
-              ? const Center(child: Text('No editable text found.'))
-              : ListView.builder(
-                  itemCount: items.length,
-                  itemBuilder: (context, i) {
-                    final item = items[i];
-                    return Padding(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 4),
-                      child: TextField(
-                        controller: _controllerFor(i, item.text),
-                        maxLines: null,
-                        decoration: InputDecoration(
-                          isDense: true,
-                          border: const OutlineInputBorder(),
-                          labelText:
-                              item.isHeading ? 'Heading' : 'Paragraph ${i + 1}',
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
     );
   }
 }

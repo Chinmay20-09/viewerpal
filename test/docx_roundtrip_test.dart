@@ -110,20 +110,21 @@ void main() {
   });
 
   group('DOCX text modification', () {
-    test('editTextRun replaces one run and marks engine dirty', () async {
+    test('editParagraphText replaces paragraph text and marks engine dirty',
+        () async {
       final engine = DocxDocumentEngine();
       await engine.open(makeDoc(fixtureFile.path));
 
       final target =
           engine.paragraphs().firstWhere((p) => p.text.contains('Second paragraph'));
       expect(
-        engine.editTextRun(target.index, 0, 'EDITED RUN TEXT'),
+        engine.editParagraphText(target.index, 'EDITED PARAGRAPH TEXT'),
         isTrue,
       );
       expect(engine.isDirty, isTrue);
       expect(
         engine.paragraphs().firstWhere((p) => p.text.contains('EDITED')).text,
-        contains('EDITED RUN TEXT'),
+        contains('EDITED PARAGRAPH TEXT'),
       );
       engine.dispose();
     });
@@ -152,7 +153,7 @@ void main() {
     test('editing rejects out-of-range indices', () async {
       final engine = DocxDocumentEngine();
       await engine.open(makeDoc(fixtureFile.path));
-      expect(engine.editTextRun(9999, 0, 'x'), isFalse);
+      expect(engine.editParagraphText(9999, 'x'), isFalse);
       expect(engine.editParagraphText(-1, 'x'), isFalse);
       engine.dispose();
     });

@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:excel_plus/excel_plus.dart';
@@ -6,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/models/document_file.dart';
+import '../../core/services/document_access.dart';
 import '../document_engine.dart';
 
 /// XLSX engine using excel_plus: read, browse sheets, edit a cell, Save As.
@@ -24,14 +24,8 @@ class XlsxDocumentEngine extends DocumentEngine {
 
   Future<void> _ensureLoaded(DocumentFile document) async {
     if (_excel != null) return;
-    final f = File(document.uri);
-    if (!f.existsSync()) {
-      throw DocumentOpenException('File not found: ${document.filename}');
-    }
-    final bytes = await f.readAsBytes();
-    if (bytes.isEmpty) {
-      throw DocumentOpenException('File is empty: ${document.filename}');
-    }
+    // Works for both local paths and Android SAF content URIs.
+    final bytes = await DocumentAccess.readBytes(document.uri);
     try {
       _excel = Excel.decodeBytes(bytes);
     } on ExcelException catch (e) {

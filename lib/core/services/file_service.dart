@@ -1,7 +1,7 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:android_file_picker/android_file_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/document_file.dart';
@@ -32,37 +32,73 @@ class FileService {
 
   /// Opens the system document picker filtered to supported types.
   ///
-  /// Uses the SAF-backed picker (no broad storage permissions required).
+  /// Uses the SAF-backed picker (no storage permissions required) with a
+  /// *lifetime* read grant so the returned `content://` URI can be persisted
+  /// (and re-opened later from Recents).
+  ///
+  /// The plugin always mirrors the picked bytes into a cache copy; that copy
+  /// is EPHEMERAL and is never persisted as the document identity. The SAF
+  /// `content://` URI is stored instead ([DocumentFile.sourcePath]).
   Future<DocumentFile> pickDocument() async {
     final result = await FilePicker.pickFiles(
       dialogTitle: 'Open document',
       type: FileType.custom,
       allowedExtensions: allowedExtensions,
+      androidOptions: FilePickerAndroidOptions(
+        safOptions: AndroidSAFOptions(
+          grant: AndroidSAFGrant.lifetime,
+          accessMode: AndroidSAFAccessMode.readOnly,
+          persistGrant: true,
+        ),
+      ),
     );
     if (result.isEmpty) throw const FilePickCancelled();
 
     final f = result.first;
-    final path = f.path;
-    if (path == null) {
+    final contentUri = _contentUriOf(f);
+    if (contentUri == null) {
       throw UnreadableDocumentException(
         'The selected file could not be opened on this device.',
       );
     }
-    final file = File(path);
-    if (!file.existsSync()) {
-      throw UnreadableDocumentException(
-        'The selected file is no longer accessible.',
-      );
-    }
 
+    // Prefer the SAF content URI as identity; fall back to a local path on
+    // platforms without SAF (desktop/test). size: null because lengthSync()
+    // reports the cache-copy size, which may already be stale.
     final doc = DocumentFile.fromPickedFile(
       name: f.name,
-      path: path,
-      uri: path,
-      size: f.lengthSync(),
+      uri: contentUri,
+      sourcePath: contentUri,
+      mimeType: null,
     );
     await addRecent(doc);
     return doc;
+  }
+
+  /// Extracts the canonical SAF `content://` URI from a picked file.
+  ///
+  /// Returns null when the platform does not provide one (desktop/test),
+  /// in which case the local path remains the identity.
+  String? _contentUriOf(Object f) {
+    // AndroidPlatformFile exposes safHandle.uri for SAF picks; accessed via
+    // dynamic members to avoid a hard compile-time dependency shape while
+    // still working with the concrete Android implementation.
+    try {
+      final handle = (f as dynamic).safHandle;
+      final uri = handle?.uri?.toString();
+      if (uri != null && uri.startsWith('content://')) return uri;
+    } catch (_) {
+      // Not the Android implementation.
+    }
+    // Fallback: the plugin sometimes reports the content URI directly as the
+    // identifier/uri string.
+    try {
+      final raw = (f as dynamic).uri?.toString();
+      if (raw != null && raw.startsWith('content://')) return raw;
+    } catch (_) {
+      // Property missing on this platform implementation.
+    }
+    return null;
   }
 
   /// Loads recent documents (most recent first).

@@ -32,6 +32,7 @@ class DocumentFile {
     required this.type,
     this.mimeType,
     this.sizeBytes,
+    this.sourcePath,
   });
 
   /// Content URI (e.g. `content://...`) or `file://`/plain path.
@@ -41,6 +42,14 @@ class DocumentFile {
   final DocumentType type;
   final String? mimeType;
   final int? sizeBytes;
+
+  /// Original SAF `content://` URI as returned by the Android document
+  /// picker, kept separately from [uri] so the canonical source of the
+  /// document survives when [uri] points at an app-local working copy.
+  ///
+  /// Never treated as a plain filesystem path; resolved via the platform
+  /// content resolver when it is a `content://` URI.
+  final String? sourcePath;
 
   bool get isSupported => type != DocumentType.unknown;
 
@@ -114,6 +123,7 @@ class DocumentFile {
     required String uri,
     int? size,
     String? mimeType,
+    String? sourcePath,
   }) {
     final type = detectType(
       mimeType: mimeType,
@@ -128,6 +138,7 @@ class DocumentFile {
       type: type,
       mimeType: mimeType,
       sizeBytes: size,
+      sourcePath: sourcePath,
     );
   }
 
@@ -138,6 +149,7 @@ class DocumentFile {
         'type': type.name,
         'mimeType': mimeType,
         'sizeBytes': sizeBytes,
+        'sourcePath': sourcePath,
       };
 
   static DocumentFile fromJson(Map<String, dynamic> json) => DocumentFile(
@@ -150,7 +162,15 @@ class DocumentFile {
         ),
         mimeType: json['mimeType'] as String?,
         sizeBytes: json['sizeBytes'] as int?,
+        sourcePath: json['sourcePath'] as String?,
       );
+
+  /// The original document URI to keep for reopening: prefer the SAF
+  /// content URI; fall back to the current [uri].
+  String get originalUri =>
+      (sourcePath != null && sourcePath!.startsWith('content://'))
+          ? sourcePath!
+          : uri;
 
   @override
   String toString() => 'DocumentFile($filename, $type)';

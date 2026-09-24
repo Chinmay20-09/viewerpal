@@ -1,8 +1,7 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 
 import '../../core/models/document_file.dart';
+import '../../core/services/document_access.dart';
 import '../../core/services/file_service.dart';
 import '../viewer/viewer_screen.dart';
 
@@ -63,14 +62,22 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openRecent(DocumentFile d) async {
-    final file = File(d.uri);
-    if (!file.existsSync()) {
-      _showError('This file is no longer accessible.');
-      await _fileService.removeRecent(d.uri);
-      _loadRecents();
+    // Check accessibility WITHOUT assuming the URI is a filesystem path:
+    // SAF content:// URIs are resolved through the platform content resolver
+    // (persisted grant), local paths through dart:io.
+    final ok = await DocumentAccess.isAccessible(d.uri);
+    if (!mounted) return;
+    if (!ok) {
+      _showError(
+        '"${d.filename}" is no longer accessible.\n'
+        'Its access permission may have been revoked, or the file was '
+        'moved or deleted. Pick it again to reopen it.',
+      );
+      // Keep the recent entry (the user may re-grant access); simply don't
+      // navigate. Removing it would lose the user's history on a transient
+      // permission issue.
       return;
     }
-    if (!mounted) return;
     await Navigator.of(context).pushNamed(
       ViewerScreen.routeName,
       arguments: d,
