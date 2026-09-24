@@ -52,13 +52,13 @@ class PptxDocumentEngine extends DocumentEngine {
 
   @override
   Future<void> open(DocumentFile document) async {
-    final f = File(document.uri);
-    if (!f.existsSync()) {
-      throw DocumentOpenException('File not found: ${document.filename}');
-    }
-    final bytes = await f.readAsBytes();
-    if (bytes.isEmpty) {
-      throw DocumentOpenException('File is empty: ${document.filename}');
+    // Read through DocumentAccess so both plain filesystem paths and Android
+    // SAF content:// URIs work (same policy as the other engines).
+    final Uint8List bytes;
+    try {
+      bytes = await DocumentAccess.readBytes(document.uri);
+    } on DocumentAccessException catch (e) {
+      throw DocumentOpenException(e.message, e);
     }
     // PPTX is a ZIP; check the magic bytes (PK) for a friendly error.
     // (The zip decoder can be lenient with garbage input, so this check
