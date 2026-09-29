@@ -1,8 +1,10 @@
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:docx_creator/docx_creator.dart';
 import 'package:docx_file_viewer/docx_file_viewer.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/models/document_file.dart';
 import '../../core/services/document_access.dart';
@@ -27,6 +29,11 @@ class DocxDocumentEngine extends InlineEditingEngine {
   String? _lastSavedName;
   String? _lastSavedUri;
 
+  /// URI of the document passed to [open] — the key for last-saved
+  /// persistence so Share can still offer a generated copy after the
+  /// engine is recreated.
+  String? _openedUri;
+
   final ValueNotifier<bool> _editMode = ValueNotifier<bool>(false);
   SaveAsBytes _saveAsHandler = _defaultSaveAsHandler;
 
@@ -38,6 +45,7 @@ class DocxDocumentEngine extends InlineEditingEngine {
         canEdit: true,
         canSave: false, // in-place overwrite deliberately avoided in MVP
         canSaveAs: true,
+        canSearch: true, // the DocxView-based viewer supports text search
       );
 
   @override
@@ -70,6 +78,7 @@ class DocxDocumentEngine extends InlineEditingEngine {
   /// the content resolver — never treated as a temp path).
   Future<void> _ensureLoaded(DocumentFile document) async {
     if (_document != null) return;
+    _openedUri = document.uri;
     final Uint8List bytes;
     try {
       bytes = await DocumentAccess.readBytes(document.uri);
@@ -281,8 +290,59 @@ class DocxDocumentEngine extends InlineEditingEngine {
     _lastSavedName = suggestedName;
     _dirty = false;
     _previewStale = true;
+    await _persistLastSaved();
     return SaveResult.savedAs;
   }
+
+  @override
+  Future<ShareTarget> shareTarget(DocumentFile document) async {
+    // Prefer the generated copy: a real app-managed file that always exists,
+    // unlike a content:// URI which depends on a live SAF grant.
+    final savedUri = _lastSavedUri;
+    if (savedUri != null && File(savedUri).existsSync()) {
+      return ShareTarget(path: savedUri, name: _lastSavedName ?? document.filename);
+    }
+    return super.shareTarget(document);
+  }
+
+  static const _lastSavedPrefix = 'docx_last_saved_';
+
+  /// Restores the last saved copy reference so Share still offers the
+  /// generated file after the engine is recreated (e.g. viewer reopened).
+  @override
+  Future<void> restoreLastSaved() async {
+    if (_lastSavedUri != null) return;
+    final opened = _openedUri;
+    if (opened == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = '$_lastSavedPrefix${documentKey(opened)}';
+      final name = prefs.getString('${key}_name');
+      final path = prefs.getString('${key}_path');
+      if (name != null && path != null && File(path).existsSync()) {
+        _lastSavedName = name;
+        _lastSavedUri = path;
+      }
+    } catch (_) {
+      // Best-effort: sharing then falls back to the original document.
+    }
+  }
+
+  Future<void> _persistLastSaved() async {
+    final opened = _openedUri;
+    if (opened == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = '$_lastSavedPrefix${documentKey(opened)}';
+      await prefs.setString('${key}_name', _lastSavedName ?? '');
+      await prefs.setString('${key}_path', _lastSavedUri ?? '');
+    } catch (_) {
+      // Best-effort persistence.
+    }
+  }
+
+  /// Stable key for an opened document, used for last-saved persistence.
+  static String documentKey(String uri) => Uri.encodeComponent(uri);
 
   @override
   void dispose() {

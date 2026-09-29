@@ -98,6 +98,21 @@ class DocumentAccess {
     }
   }
 
+  /// Sanitizes a filename into a safe single-path-segment name.
+  ///
+  /// Keeps Unicode letters/digits (so e.g. '报告 (1).docx' stays readable),
+  /// plus dots, dashes, spaces and parentheses; replaces path separators and
+  /// control characters, and collapses anything else to '_'. Empty results
+  /// fall back to 'document' (extension must be re-appended by the caller).
+  static String safeFilename(String filename) {
+    var name = filename.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1F]'), '_');
+    name = name.trim();
+    if (name.isEmpty || name == '.' || name == '..') {
+      name = 'document';
+    }
+    return name;
+  }
+
   /// Ensures a real filesystem path exists for viewers that need one
   /// (e.g. the native PDF view). For local documents this is a no-op; for
   /// SAF content URIs it creates a local READ-ONLY working copy in the app
@@ -119,8 +134,17 @@ class DocumentAccess {
 
     final bytes = await readBytes(uri);
     final dir = await _cacheDir();
-    final safeName = filename.replaceAll(RegExp(r'[^\w.\- ()]'), '_');
-    final path = '$dir/$safeName';
+    final safeName = safeFilename(filename);
+    // Collisions between distinct URIs with the same display name must not
+    // make one document mirror another: disambiguate with a short hash.
+    var path = '$dir/$safeName';
+    if (File(path).existsSync() && _localCopies.containsValue(path)) {
+      final tag = uri.hashCode.toUnsigned(24).toRadixString(36);
+      final dot = safeName.lastIndexOf('.');
+      path = dot > 0
+          ? '$dir/${safeName.substring(0, dot)}_$tag${safeName.substring(dot)}'
+          : '$dir/${safeName}_$tag';
+    }
     final f = File(path);
     f.writeAsBytesSync(bytes, flush: true);
     _localCopies[uri] = path;
@@ -129,11 +153,16 @@ class DocumentAccess {
 
   /// Stores an app-managed copy (e.g. a Save As result that must remain
   /// openable without any SAF grant) and returns its local path.
+  ///
+  /// An existing file with the same name is overwritten IN FULL with the
+  /// new bytes (never appended to), so a saved copy never mixes content
+  /// from a previous save of the same name.
   static Future<String> storeLocalCopy(String filename, Uint8List bytes) async {
     final base = await _appFilesDir();
-    final safeName = filename.replaceAll(RegExp(r'[^\w.\- ()]'), '_');
+    final safeName = safeFilename(filename);
     final path = '$base/$safeName';
     final f = File(path);
+    if (f.existsSync()) f.deleteSync();
     f.writeAsBytesSync(bytes, flush: true);
     return path;
   }

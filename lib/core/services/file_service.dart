@@ -4,7 +4,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:android_file_picker/android_file_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../models/document_file.dart';
+import '../models/document_file.dart' show DocumentFile, kMimeToDocumentType;
 
 /// Thrown when the user cancels the system file picker.
 class FilePickCancelled implements Exception {
@@ -55,24 +55,43 @@ class FileService {
     if (result.isEmpty) throw const FilePickCancelled();
 
     final f = result.first;
-    final contentUri = _contentUriOf(f);
+    // Prefer the SAF content URI as identity; fall back to a local path on
+    // platforms without SAF (desktop/test). size: null because lengthSync()
+    // reports the cache-copy size, which may already be stale.
+    final contentUri = _contentUriOf(f) ?? _localPathOf(f);
     if (contentUri == null) {
       throw UnreadableDocumentException(
         'The selected file could not be opened on this device.',
       );
     }
 
-    // Prefer the SAF content URI as identity; fall back to a local path on
-    // platforms without SAF (desktop/test). size: null because lengthSync()
-    // reports the cache-copy size, which may already be stale.
+    // MIME detection: the Android picker may report a generic type such as
+    // application/octet-stream, which would push detection to the
+    // extension/header fallbacks. Only pass through MIME values that the
+    // app actually understands; anything else is intentionally ignored.
+    final rawMime = (f as dynamic).mimeType as String?;
+    final mime =
+        rawMime != null && kMimeToDocumentType.containsKey(rawMime.trim().toLowerCase())
+            ? rawMime
+            : null;
+
     final doc = DocumentFile.fromPickedFile(
       name: f.name,
+      path: contentUri.startsWith('content://') ? null : contentUri,
       uri: contentUri,
       sourcePath: contentUri,
-      mimeType: null,
+      mimeType: mime,
+      size: null,
     );
     await addRecent(doc);
     return doc;
+  }
+
+  /// Resolves the local path of a picked file for platforms without SAF.
+  String? _localPathOf(Object f) {
+    final path = (f as dynamic).path as String?;
+    if (path == null || path.isEmpty) return null;
+    return path.startsWith('file://') ? path : 'file://$path';
   }
 
   /// Extracts the canonical SAF `content://` URI from a picked file.

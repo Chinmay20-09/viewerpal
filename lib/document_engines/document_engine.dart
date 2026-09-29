@@ -3,21 +3,35 @@ import 'dart:typed_data';
 import 'package:flutter/widgets.dart';
 
 import '../../core/models/document_file.dart';
+import '../../core/services/document_access.dart';
 
 /// Result of a save operation.
 enum SaveResult { saved, savedAs, unsupported, failed, cancelled }
 
 /// Capabilities a document engine advertises.
+///
+/// Each engine declares ONLY what it genuinely implements; the UI derives
+/// every visible action from these flags instead of assuming a uniform
+/// feature set across formats.
 class EngineCapabilities {
   const EngineCapabilities({
     required this.canEdit,
     required this.canSave,
     required this.canSaveAs,
+    this.canSearch = false,
+    this.canAnnotate = false,
   });
 
   final bool canEdit;
   final bool canSave;
   final bool canSaveAs;
+
+  /// True when the built-in viewer supports text search.
+  final bool canSearch;
+
+  /// True when the viewer supports user-added overlays/annotations
+  /// (e.g. the PDF editor's text/image elements).
+  final bool canAnnotate;
 }
 
 /// Base interface for format-specific document engines.
@@ -48,8 +62,48 @@ abstract class DocumentEngine {
   /// Engines that do not support Save As throw [UnsupportedError].
   Future<SaveResult> saveAs(DocumentFile document);
 
+  /// Prepares the document for sharing and returns its real location.
+  ///
+  /// Engines that only produce files through Save As (no in-place save)
+  /// return their most recently saved copy here — a real local file the
+  /// platform share sheet can attach. Engines without any produced artifact
+  /// return the original [document] location. A successful result must
+  /// always be a readable `file://`/plain path or a resolvable content URI.
+  ///
+  /// Throws [ShareUnavailableException] when nothing shareable currently
+  /// exists (e.g. no copy has been saved yet and the original was deleted).
+  Future<ShareTarget> shareTarget(DocumentFile document) async {
+    final uri = document.originalUri;
+    if (await DocumentAccess.isAccessible(uri)) {
+      return ShareTarget(path: uri, name: document.filename);
+    }
+    throw ShareUnavailableException(
+      '"${document.filename}" is no longer accessible. '
+      'Pick it again to share it.',
+    );
+  }
+
   /// Releases any resources held by the engine.
   void dispose();
+}
+
+/// A concrete, shareable document location produced by [DocumentEngine.shareTarget].
+class ShareTarget {
+  const ShareTarget({required this.path, required this.name});
+
+  /// Local filesystem path or resolvable Android content URI.
+  final String path;
+
+  /// Display/file name for the shared file.
+  final String name;
+}
+
+/// Thrown by [DocumentEngine.shareTarget] when no shareable file exists.
+class ShareUnavailableException implements Exception {
+  const ShareUnavailableException(this.message);
+  final String message;
+  @override
+  String toString() => message;
 }
 
 /// Shared error used to signal corrupt/failed document parsing.
@@ -61,9 +115,10 @@ class DocumentOpenException implements Exception {
   String toString() => 'DocumentOpenException: $message';
 }
 
-/// Callback that persists document bytes as a NEW file via the platform
-/// Save As dialog (Android SAF), returning the destination URI or null when
-/// the user cancelled.
+/// Callback that writes document bytes through the platform Save As dialog
+/// (Android SAF), returning the destination URI or null when the user
+/// cancelled. Engines additionally persist the bytes with
+/// [DocumentAccess.storeLocalCopy] so the copy stays openable/shareable.
 typedef SaveAsBytes = Future<Uri?> Function(
   Uint8List bytes,
   String suggestedFileName,
@@ -92,6 +147,10 @@ abstract class InlineEditingEngine extends DocumentEngine {
   /// Name of the most recently saved copy (empty when none), for sharing it
   /// immediately after a successful Save As.
   String get lastSavedName;
+
+  /// Best-effort restore of the last saved copy reference (e.g. after the
+  /// engine was recreated), so Share can offer the generated file.
+  Future<void> restoreLastSaved() async {}
 
   /// URI of the most recently saved copy (null when none). Prefer this when
   /// sharing the result of a Save As; it may be a local path under the app's

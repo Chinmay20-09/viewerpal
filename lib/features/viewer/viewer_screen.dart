@@ -5,9 +5,10 @@ import 'package:file_picker/file_picker.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../../core/models/document_file.dart';
-import '../../core/services/document_access.dart';
 import '../../core/services/document_router.dart';
 import '../../document_engines/document_engine.dart';
+import '../../document_engines/pdf/pdf_engine.dart';
+import '../pdf_editor/pdf_editor_screen.dart';
 
 /// Viewer screen: routes the document to the correct engine and hosts
 /// the engine's viewer widget, plus Save/Save As/Share actions.
@@ -35,7 +36,6 @@ class _ViewerScreenState extends State<ViewerScreen> {
   bool _saving = false;
   bool _editMode = false;
   String? _lastSavedName;
-  String? _lastSavedUri;
 
   DocumentFile? get _document =>
       widget.document ??
@@ -80,6 +80,16 @@ class _ViewerScreenState extends State<ViewerScreen> {
         engine.setSaveAsHandler(_saveBytesAs);
         engine.editMode.addListener(_onEngineEditModeChanged);
         _editMode = engine.editMode.value;
+      }
+      if (engine is PdfDocumentEngine) {
+        // Wire the dedicated PDF editor through the SAME engine instance
+        // that opened this document, so Edit never hits a dead instance.
+        engine.setEditorOpener(_openPdfEditor);
+      }
+      // Restore any previously generated copy so Share offers it even
+      // after the viewer/engine has been recreated.
+      if (engine is InlineEditingEngine) {
+        await engine.restoreLastSaved();
       }
       setState(() {
         _engine = engine;
@@ -259,7 +269,6 @@ class _ViewerScreenState extends State<ViewerScreen> {
         _saving = false;
         if (result == SaveResult.savedAs) {
           _lastSavedName = engine.lastSavedName;
-          _lastSavedUri = engine.lastSavedUri;
           engine.editMode.value = false; // back to view mode, same screen
         }
       });
@@ -326,26 +335,31 @@ class _ViewerScreenState extends State<ViewerScreen> {
     }
   }
 
+  /// Opens the dedicated PDF editor (wired into [PdfDocumentEngine]).
+  void _openPdfEditor(BuildContext context, DocumentFile document) {
+    Navigator.of(context).pushNamed(
+      PdfEditorScreen.routeName,
+      arguments: document,
+    );
+  }
+
+  /// Shares the document through the ENGINE's share target: inline-edit
+  /// engines (DOCX) prefer their most recently generated copy; other
+  /// engines fall back to the original document location. The host never
+  /// guesses where the shareable file lives.
   Future<void> _share(DocumentFile doc) async {
+    final engine = _engine;
+    if (engine == null) return;
     try {
-      // After a successful inline Save As, share the freshly saved copy
-      // (an app-managed local file that is guaranteed to exist), not the
-      // possibly unresolvable original URI.
-      final shareUri = _lastSavedUri ?? doc.uri;
-      final shareName = _lastSavedName ?? doc.filename;
-      if (DocumentAccess.isContentUri(shareUri) &&
-          !await DocumentAccess.isAccessible(shareUri)) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-                'File is no longer accessible. Pick it again to share it.'),
-          ),
-        );
-        return;
-      }
+      final target = await engine.shareTarget(doc);
+      if (!mounted) return;
       await SharePlus.instance.share(
-        ShareParams(files: [XFile(shareUri)], text: shareName),
+        ShareParams(files: [XFile(target.path)], text: target.name),
+      );
+    } on ShareUnavailableException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.message)),
       );
     } catch (e) {
       if (!mounted) return;

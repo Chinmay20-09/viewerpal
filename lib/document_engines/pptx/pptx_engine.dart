@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -39,6 +40,29 @@ class PptxDocumentEngine extends DocumentEngine {
   Uint8List? _originalBytes;
   final Map<String, String> _edits = {}; // '<slidePos>:<paraIdx>' -> text
   bool _dirty = false;
+  String? _lastSavedName;
+  String? _lastSavedUri;
+
+  /// Writable Save As handler (defaults to the platform SAF dialog).
+  /// Injectable so tests can capture exported bytes without a dialog.
+  SaveAsBytes _saveAsHandler = _defaultSaveAsHandler;
+
+  static Future<Uri?> _defaultSaveAsHandler(
+    Uint8List bytes,
+    String suggestedFileName,
+    String mimeType,
+  ) {
+    return FilePicker.saveFile(
+      fileName: suggestedFileName,
+      bytes: bytes,
+      mimeType: mimeType,
+    );
+  }
+
+  /// Injects a custom Save As handler (tests; production keeps the default).
+  void setSaveAsHandler(SaveAsBytes handler) {
+    _saveAsHandler = handler;
+  }
 
   @override
   String get name => 'PptxDocumentEngine';
@@ -48,6 +72,7 @@ class PptxDocumentEngine extends DocumentEngine {
         canEdit: true,
         canSave: false, // in-place overwrite deliberately avoided
         canSaveAs: true,
+        canSearch: false, // no text search across slides in the MVP
       );
 
   @override
@@ -225,14 +250,30 @@ class PptxDocumentEngine extends DocumentEngine {
     final bytes = await exportBytes();
     final base = document.filename
         .replaceAll(RegExp(r'\.pptx$', caseSensitive: false), '');
-    final uri = await FilePicker.saveFile(
-      fileName: '$base (edited).pptx',
-      bytes: bytes,
-      mimeType:
-          'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    final suggestedName = '$base (edited).pptx';
+    // SAF Save As dialog: the user picks the destination; cancelling aborts.
+    final uri = await _saveAsHandler(
+      bytes,
+      suggestedName,
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     );
     if (uri == null) return SaveResult.cancelled;
+
+    // Keep an app-managed copy so the generated file can be reopened and
+    // shared even when the SAF destination is not a filesystem path.
+    _lastSavedName = suggestedName;
+    _lastSavedUri = await DocumentAccess.storeLocalCopy(suggestedName, bytes);
     return SaveResult.savedAs;
+  }
+
+  @override
+  Future<ShareTarget> shareTarget(DocumentFile document) async {
+    // Prefer the generated copy: a real app-managed file that always exists.
+    final savedUri = _lastSavedUri;
+    if (savedUri != null && File(savedUri).existsSync()) {
+      return ShareTarget(path: savedUri, name: _lastSavedName!);
+    }
+    return super.shareTarget(document);
   }
 
   @override
@@ -241,6 +282,8 @@ class PptxDocumentEngine extends DocumentEngine {
     _originalBytes = null;
     _edits.clear();
     _dirty = false;
+    _lastSavedName = null;
+    _lastSavedUri = null;
   }
 }
 
@@ -345,26 +388,6 @@ class _PptxViewerState extends State<_PptxViewer> {
     });
   }
 
-  void _applyEdits() {
-    final engine = widget.engine;
-    final texts = engine.slideTexts(_current);
-    var applied = 0;
-    _controllers.forEach((i, c) {
-      if (i >= 0 && i < texts.length && c.text != texts[i]) {
-        if (engine.editSlideText(_current, i, c.text)) applied++;
-      }
-    });
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(applied > 0
-            ? '$applied edit(s) applied. Use Save As to export.'
-            : 'No changes to apply.'),
-      ),
-    );
-    setState(() {});
-  }
-
   @override
   Widget build(BuildContext context) {
     final slides = doc.slides;
@@ -450,6 +473,10 @@ class _PptxViewerState extends State<_PptxViewer> {
     );
   }
 
+  /// Inline text editing for the current slide. Every keystroke updates the
+  /// in-memory model immediately — no Apply step, no lost edits when
+  /// switching slides (controllers are cleared but edits are already
+  /// persisted in the engine's model).
   Widget _buildEditor() {
     final texts = widget.engine.slideTexts(_current);
     return Column(
@@ -458,7 +485,7 @@ class _PptxViewerState extends State<_PptxViewer> {
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
           child: Text(
             'Text editing — slide structure and layout are kept. '
-            'Apply before switching slides.',
+            'Use Save to export a copy.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
         ),
@@ -478,6 +505,8 @@ class _PptxViewerState extends State<_PptxViewer> {
                           () => TextEditingController(text: texts[i]),
                         ),
                         maxLines: null,
+                        onChanged: (v) =>
+                            widget.engine.editSlideText(_current, i, v),
                         decoration: InputDecoration(
                           isDense: true,
                           border: const OutlineInputBorder(),
@@ -487,13 +516,6 @@ class _PptxViewerState extends State<_PptxViewer> {
                     );
                   },
                 ),
-        ),
-        Padding(
-          padding: const EdgeInsets.only(bottom: 4),
-          child: FilledButton(
-            onPressed: _applyEdits,
-            child: const Text('Apply'),
-          ),
         ),
       ],
     );
