@@ -47,6 +47,22 @@ class DocumentAccess {
   /// True when [uri] is an Android SAF content URI.
   static bool isContentUri(String uri) => uri.startsWith('content://');
 
+  /// Takes a persistable read grant on a picked SAF `content://` URI so it
+  /// stays readable across activity restarts. Returns false when the
+  /// provider does not offer persistable grants (or the call is unsupported
+  /// on this platform), in which case the caller should cache a local copy.
+  static Future<bool> persistReadGrant(String uri) async {
+    if (!isContentUri(uri)) return true; // local paths need no grant
+    try {
+      final ok = await _channel.invokeMethod<bool>('persistUri', {
+        'uri': uri,
+      });
+      return ok ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Reads the full bytes of a document, local or SAF-backed.
   static Future<Uint8List> readBytes(String uri) async {
     if (isLocalPath(uri)) {

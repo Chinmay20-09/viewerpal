@@ -2,9 +2,11 @@ import 'dart:convert';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:android_file_picker/android_file_picker.dart';
+import 'package:mime/mime.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/document_file.dart' show DocumentFile, kMimeToDocumentType;
+import 'document_access.dart';
 
 /// Thrown when the user cancels the system file picker.
 class FilePickCancelled implements Exception {
@@ -36,9 +38,9 @@ class FileService {
   /// *lifetime* read grant so the returned `content://` URI can be persisted
   /// (and re-opened later from Recents).
   ///
-  /// The plugin always mirrors the picked bytes into a cache copy; that copy
-  /// is EPHEMERAL and is never persisted as the document identity. The SAF
-  /// `content://` URI is stored instead ([DocumentFile.sourcePath]).
+  /// Detection flow (single source of truth = [DocumentFile.detectType]):
+  /// SAF picker → PlatformFile.name/extension → MIME via package:mime →
+  /// DocumentType → DocumentRouter → engine.
   Future<DocumentFile> pickDocument() async {
     final result = await FilePicker.pickFiles(
       dialogTitle: 'Open document',
@@ -56,8 +58,8 @@ class FileService {
 
     final f = result.first;
     // Prefer the SAF content URI as identity; fall back to a local path on
-    // platforms without SAF (desktop/test). size: null because lengthSync()
-    // reports the cache-copy size, which may already be stale.
+    // platforms without SAF (desktop/test). [PlatformFile.path] is null for
+    // content URIs and must never be assumed to exist.
     final contentUri = _contentUriOf(f) ?? _localPathOf(f);
     if (contentUri == null) {
       throw UnreadableDocumentException(
@@ -65,58 +67,78 @@ class FileService {
       );
     }
 
-    // MIME detection: the Android picker may report a generic type such as
-    // application/octet-stream, which would push detection to the
-    // extension/header fallbacks. Only pass through MIME values that the
-    // app actually understands; anything else is intentionally ignored.
-    final rawMime = (f as dynamic).mimeType as String?;
+    // MIME metadata: derived from the FILENAME via package:mime.
+    // AndroidPlatformFile does NOT expose a mimeType getter, and OS pickers
+    // often report generic types (application/octet-stream) anyway, so the
+    // extension is the one reliable signal. lookupMimeType lowercases the
+    // extension internally, so 'REPORT.PDF' and 'testing.docx' both resolve.
+    // Only values that map to a supported DocumentType are kept; everything
+    // else stays null and DocumentFile.detectType falls back to its own
+    // extension logic.
+    final rawMime = lookupMimeType(f.name);
     final mime =
-        rawMime != null && kMimeToDocumentType.containsKey(rawMime.trim().toLowerCase())
-            ? rawMime
+        rawMime != null && kMimeToDocumentType.containsKey(rawMime.trim())
+            ? rawMime.trim()
             : null;
+
+    // The picker plugin only hands out a short-lived read grant: without a
+    // persistable grant the URI becomes unreadable after an app restart (and
+    // on some OEM pickers the persistable flag is missing entirely, so the
+    // grant cannot be persisted at all).
+    //
+    // 1. Try to persist the grant → the SAF URI stays canonical.
+    // 2. Otherwise, while the transient grant is still alive (the plugin just
+    //    used it to mirror the bytes into its own cache copy), save the bytes
+    //    into app-owned storage and make THAT local copy the document
+    //    identity, keeping the SAF URI only as provenance.
+    var identity = contentUri;
+    String? provenance;
+    if (DocumentAccess.isContentUri(contentUri)) {
+      final persisted = await DocumentAccess.persistReadGrant(contentUri);
+      if (!persisted) {
+        try {
+          final bytes = await DocumentAccess.readBytes(contentUri);
+          identity = await DocumentAccess.storeLocalCopy(f.name, bytes);
+        } on DocumentAccessException catch (e) {
+          throw UnreadableDocumentException(e.message);
+        }
+        // The local copy is now the identity; the content URI is kept only
+        // as provenance and must NOT be treated as a readable source.
+        provenance = contentUri;
+      }
+    }
 
     final doc = DocumentFile.fromPickedFile(
       name: f.name,
-      path: contentUri.startsWith('content://') ? null : contentUri,
-      uri: contentUri,
-      sourcePath: contentUri,
+      path: identity.startsWith('content://') ? null : identity,
+      uri: identity,
+      sourcePath: provenance ?? contentUri,
       mimeType: mime,
-      size: null,
+      size: f.lengthSync(),
     );
     await addRecent(doc);
     return doc;
   }
 
   /// Resolves the local path of a picked file for platforms without SAF.
-  String? _localPathOf(Object f) {
-    final path = (f as dynamic).path as String?;
+  ///
+  /// [PlatformFile.path] is a typed nullable getter (null for non-file URIs,
+  /// e.g. Android SAF content URIs), so it is safe to read directly.
+  String? _localPathOf(PlatformFile f) {
+    final path = f.path;
     if (path == null || path.isEmpty) return null;
     return path.startsWith('file://') ? path : 'file://$path';
   }
 
   /// Extracts the canonical SAF `content://` URI from a picked file.
   ///
-  /// Returns null when the platform does not provide one (desktop/test),
-  /// in which case the local path remains the identity.
-  String? _contentUriOf(Object f) {
-    // AndroidPlatformFile exposes safHandle.uri for SAF picks; accessed via
-    // dynamic members to avoid a hard compile-time dependency shape while
-    // still working with the concrete Android implementation.
-    try {
-      final handle = (f as dynamic).safHandle;
-      final uri = handle?.uri?.toString();
-      if (uri != null && uri.startsWith('content://')) return uri;
-    } catch (_) {
-      // Not the Android implementation.
-    }
-    // Fallback: the plugin sometimes reports the content URI directly as the
-    // identifier/uri string.
-    try {
-      final raw = (f as dynamic).uri?.toString();
-      if (raw != null && raw.startsWith('content://')) return raw;
-    } catch (_) {
-      // Property missing on this platform implementation.
-    }
+  /// On Android, SAF picks carry the content URI in `safHandle.uri`
+  /// ([AndroidPlatformFile]); other platforms never have one and null is
+  /// returned so the local path remains the identity.
+  String? _contentUriOf(PlatformFile f) {
+    final handle = f.safHandleOrNull;
+    final uri = handle?.uri.toString();
+    if (uri != null && uri.startsWith('content://')) return uri;
     return null;
   }
 
@@ -172,5 +194,17 @@ class FileService {
         list.map((d) => jsonEncode(d.toJson())).toList(),
       );
     } catch (_) {}
+  }
+}
+
+/// Extension on the shared [PlatformFile] interface that safely exposes the
+/// Android SAF handle without dynamic dispatch: returns null on every other
+/// platform implementation.
+extension PlatformFileSaf on PlatformFile {
+  /// The SAF handle for Android picks, or null elsewhere.
+  AndroidSAFHandle? get safHandleOrNull {
+    final f = this;
+    if (f is AndroidPlatformFile) return f.safHandle;
+    return null;
   }
 }
